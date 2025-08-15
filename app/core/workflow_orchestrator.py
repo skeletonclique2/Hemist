@@ -11,11 +11,20 @@ import uuid
 import structlog
 from enum import Enum
 
+import langsmith
+from prometheus_client import Counter, Histogram
+
 from .state_machine import WorkflowStateMachine, WorkflowContext, WorkflowState
 from .base_agent import BaseAgent, AgentStatus, AgentType
 from .agent_communication import AgentCommunicationHub, AgentMessage, MessageType, MessagePriority
 
 logger = structlog.get_logger()
+
+# Prometheus metrics for workflow orchestration
+WORKFLOW_STARTS = Counter("workflow_starts_total", "Total workflow executions started")
+WORKFLOW_COMPLETIONS = Counter("workflow_completions_total", "Total workflow executions completed")
+WORKFLOW_ERRORS = Counter("workflow_errors_total", "Total workflow execution errors")
+WORKFLOW_DURATION = Histogram("workflow_duration_seconds", "Workflow execution duration in seconds")
 
 class OrchestratorStatus(str, Enum):
     """Orchestrator status enumeration"""
@@ -130,7 +139,7 @@ class WorkflowOrchestrator:
     
     async def execute_workflow(self, topic: str, target_length: int = 1500, 
                              quality_threshold: float = 0.8) -> str:
-        """Execute a new workflow"""
+        """Execute a new workflow with monitoring and tracing"""
         try:
             # Create workflow execution
             execution_id = f"exec_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
@@ -141,9 +150,12 @@ class WorkflowOrchestrator:
             )
             
             self.workflows[execution_id] = workflow_execution
-            
-            # Start workflow execution in background
-            asyncio.create_task(self._execute_workflow_background(
+
+            # Prometheus: increment workflow starts
+            WORKFLOW_STARTS.inc()
+
+            # Start workflow execution in background with tracing and duration histogram
+            asyncio.create_task(self._execute_workflow_background_traced(
                 execution_id, topic, target_length, quality_threshold
             ))
             
@@ -154,33 +166,53 @@ class WorkflowOrchestrator:
             logger.error(f"Failed to start workflow execution: {e}")
             raise
     
-    async def _execute_workflow_background(self, execution_id: str, topic: str, 
+    async def _execute_workflow_background_traced(self, execution_id: str, topic: str, 
                                          target_length: int, quality_threshold: float):
-        """Execute workflow in background"""
-        try:
-            workflow_execution = self.workflows[execution_id]
-            workflow_execution.status = "running"
-            
-            # Execute workflow using state machine
-            result = await self.state_machine.execute_workflow(
-                topic, target_length, quality_threshold
-            )
-            
-            # Update execution status
-            workflow_execution.status = "completed"
-            workflow_execution.end_time = datetime.utcnow()
-            workflow_execution.progress = 1.0
-            
-            # Store result in memory
-            await self._store_workflow_result(execution_id, result)
-            
-            logger.info(f"Workflow execution {execution_id} completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Workflow execution {execution_id} failed: {e}")
-            workflow_execution.status = "error"
-            workflow_execution.error_message = str(e)
-            workflow_execution.end_time = datetime.utcnow()
+        """Execute workflow in background with tracing, metrics, and retry logic"""
+        with langsmith.trace("workflow_execution", execution_id=execution_id, topic=topic):
+            start_time = datetime.utcnow()
+            max_retries = 3
+            retry_delay = 5  # seconds
+            retries = 0
+            while retries <= max_retries:
+                try:
+                    workflow_execution = self.workflows[execution_id]
+                    workflow_execution.status = "running"
+                    
+                    # Execute workflow using state machine
+                    result = await self.state_machine.execute_workflow(
+                        topic, target_length, quality_threshold
+                    )
+                    
+                    # Update execution status
+                    workflow_execution.status = "completed"
+                    workflow_execution.end_time = datetime.utcnow()
+                    workflow_execution.progress = 1.0
+
+                    # Prometheus: record duration and completion
+                    duration = (workflow_execution.end_time - start_time).total_seconds()
+                    WORKFLOW_DURATION.observe(duration)
+                    WORKFLOW_COMPLETIONS.inc()
+                    
+                    # Store result in memory
+                    await self._store_workflow_result(execution_id, result)
+                    
+                    logger.info(f"Workflow execution {execution_id} completed successfully")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"Workflow execution {execution_id} failed (attempt {retries+1}/{max_retries+1}): {e}")
+                    workflow_execution.status = "error"
+                    workflow_execution.error_message = str(e)
+                    workflow_execution.end_time = datetime.utcnow()
+                    WORKFLOW_ERRORS.inc()
+                    retries += 1
+                    if retries <= max_retries:
+                        logger.info(f"Retrying workflow execution {execution_id} in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        logger.error(f"Workflow execution {execution_id} failed after {max_retries} retries.")
+                        raise
     
     async def _store_workflow_result(self, execution_id: str, result: WorkflowContext):
         """Store workflow result in memory"""
@@ -403,4 +435,4 @@ class WorkflowOrchestrator:
             
         except Exception as e:
             logger.error(f"Failed to get agent statuses: {e}")
-            return [] 
+            return []

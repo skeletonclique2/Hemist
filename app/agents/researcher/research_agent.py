@@ -93,9 +93,15 @@ class ResearchAgent(BaseAgent):
             await self.handle_error(e, "research execution")
             return {"status": "error", "error": str(e)}
     
+    _initial_research_cache = {}
+
     async def _conduct_initial_research(self, topic: str) -> List[Dict[str, Any]]:
-        """Conduct initial research to find relevant sources"""
+        """Conduct initial research to find relevant sources with caching"""
         try:
+            if topic in self._initial_research_cache:
+                logger.info(f"Using cached initial research results for topic: {topic}")
+                return self._initial_research_cache[topic]
+            
             logger.info(f"Starting initial research for topic: {topic}")
             
             # Use research tools to find sources
@@ -105,6 +111,7 @@ class ResearchAgent(BaseAgent):
             filtered_sources = await self._filter_sources(search_results, topic)
             
             logger.info(f"Found {len(filtered_sources)} relevant sources")
+            self._initial_research_cache[topic] = filtered_sources
             return filtered_sources
             
         except Exception as e:

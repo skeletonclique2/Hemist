@@ -1,5 +1,6 @@
 from sqlalchemy import Column, String, DateTime, Float, Text, JSON, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database.connection import Base
@@ -45,8 +46,8 @@ class ContentEmbedding(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     content_hash = Column(String(64), unique=True, nullable=False, index=True)
     content_text = Column(Text, nullable=False)
-    embedding = Column("embedding", Text)  # Will be converted to vector type by pgvector
-    content_metadata = Column(JSONB)
+    embedding = Column(Vector(1536))
+    content_metadata = Column("metadata", JSONB)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
     
     def __repr__(self):
@@ -88,4 +89,4 @@ Index('idx_agents_type', Agent.agent_type)
 Index('idx_agents_status', Agent.status)
 Index('idx_content_embeddings_hash', ContentEmbedding.content_hash)
 Index('idx_agent_memory_agent', AgentMemory.agent_id)
-Index('idx_agent_memory_type', AgentMemory.memory_type) 
+Index('idx_agent_memory_type', AgentMemory.memory_type)

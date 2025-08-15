@@ -6,6 +6,7 @@ import structlog
 
 from app.database.connection import get_db
 from app.database.models import Agent, AgentState, Workflow
+from app.core.security import get_current_user, RoleChecker
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -19,7 +20,7 @@ async def api_health_check():
         "version": "1.0.0"
     }
 
-@router.get("/agents", response_model=List[Dict[str, Any]])
+@router.get("/agents", response_model=List[Dict[str, Any]], dependencies=[Depends(RoleChecker(["admin", "user"]))])
 async def get_agents(db: AsyncSession = Depends(get_db)):
     """Get all agents in the system"""
     try:
@@ -43,7 +44,7 @@ async def get_agents(db: AsyncSession = Depends(get_db)):
             detail="Failed to fetch agents"
         )
 
-@router.get("/agents/{agent_name}/status")
+@router.get("/agents/{agent_name}/status", dependencies=[Depends(RoleChecker(["admin", "user"]))])
 async def get_agent_status(agent_name: str, db: AsyncSession = Depends(get_db)):
     """Get status of a specific agent"""
     try:
@@ -73,7 +74,7 @@ async def get_agent_status(agent_name: str, db: AsyncSession = Depends(get_db)):
             detail="Failed to fetch agent status"
         )
 
-@router.get("/workflows", response_model=List[Dict[str, Any]])
+@router.get("/workflows", response_model=List[Dict[str, Any]], dependencies=[Depends(RoleChecker(["admin", "user"]))])
 async def get_workflows(db: AsyncSession = Depends(get_db)):
     """Get all workflows in the system"""
     try:
@@ -97,7 +98,7 @@ async def get_workflows(db: AsyncSession = Depends(get_db)):
             detail="Failed to fetch workflows"
         )
 
-@router.post("/workflows")
+@router.post("/workflows", dependencies=[Depends(RoleChecker(["admin"]))])
 async def create_workflow(
     workflow_data: Dict[str, Any],
     db: AsyncSession = Depends(get_db)
@@ -142,4 +143,4 @@ async def get_system_status():
             "workflows": "running"
         },
         "version": "1.0.0"
-    } 
+    }

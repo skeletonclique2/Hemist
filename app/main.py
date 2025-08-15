@@ -1,15 +1,19 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Request, Depends, status, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import structlog
 import os
 from contextlib import asynccontextmanager
 
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter, Histogram
+from app.core.security import authenticate_user, create_access_token
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import langsmith
 from app.database.connection import init_db
 from app.api.routes import router as api_router
-from app.frontend.streamlit_app import create_streamlit_app
+# Removed import of create_streamlit_app as it does not exist
+# from app.frontend.streamlit_app import create_streamlit_app
 
 # Configure structured logging
 structlog.configure(
@@ -63,6 +67,23 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Add global exception handler for high-end error handling
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    High-end global exception handler to catch all unhandled exceptions
+    and return a structured JSON response.
+    """
+    logger.error("Unhandled exception", exc_info=exc, request_url=str(request.url))
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "message": "An unexpected error occurred. Please try again later.",
+            "details": str(exc),
+        },
+    )
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -75,7 +96,41 @@ app.add_middleware(
 # Include API routes
 app.include_router(api_router, prefix="/api/v1")
 
-# Health check endpoint
+# Pydantic model for login request
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# Authentication router
+auth_router = APIRouter()
+
+@auth_router.post("/login")
+async def login(login_request: LoginRequest):
+    """
+    Authenticate a user and return a JWT access token.
+    
+    Args:
+        login_request (LoginRequest): The login credentials.
+        
+    Returns:
+        dict: A dictionary containing the access token and token type.
+        
+    Raises:
+        HTTPException: If the credentials are invalid.
+    """
+    user = authenticate_user(login_request.username, login_request.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": user["username"], "role": user["role"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+app.include_router(auth_router, prefix="/auth")
+
+# Health check endpoint (unprotected for monitoring)
 @app.get("/health")
 async def health_check():
     """Health check endpoint for Docker health checks"""

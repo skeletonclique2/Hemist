@@ -9,6 +9,8 @@ from datetime import datetime
 import structlog
 from openai import OpenAI
 import os
+import google.generativeai as genai # Import for Gemini fallback
+from functools import lru_cache # For caching LLM calls
 
 from app.core import BaseAgent, AgentType
 from .tools import WritingTools
@@ -23,11 +25,20 @@ class WriterAgent(BaseAgent):
         
         # Initialize OpenAI client if API key is available
         api_key = os.getenv("OPENAI_API_KEY")
+        gemini_api_key = os.getenv("GEMINI_API_KEY") # Get Gemini API key
         if api_key:
             self.openai_client = OpenAI(api_key=api_key)
         else:
             self.openai_client = None
             logger.warning("No OpenAI API key provided, using fallback mode")
+        
+        # Initialize Gemini client if API key is available
+        if gemini_api_key:
+            genai.configure(api_key=gemini_api_key)
+            self.gemini_client = genai.GenerativeModel("gemini-1.5-pro-latest")
+        else:
+            self.gemini_client = None
+            logger.warning("No Gemini API key provided, Gemini fallback will not be available")
         
         self.writing_tools = WritingTools()
         self.max_iterations = 3
@@ -164,43 +175,70 @@ class WriterAgent(BaseAgent):
     
     async def _generate_initial_content(self, topic: str, content_plan: Dict[str, Any], 
                                       research_data: Dict[str, Any], writing_style: str) -> str:
-        """Generate initial content based on plan and research"""
-        try:
-            logger.info(f"Generating initial content for topic: {topic}")
-            
-            if not self.openai_client:
-                logger.info("OpenAI client not available, using fallback content generation")
-                return await self._generate_fallback_content(topic, content_plan, research_data, writing_style)
-            
-            # Use GPT to generate content
-            prompt = self._create_content_generation_prompt(topic, content_plan, research_data, writing_style)
-            
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a professional content writer expert at creating engaging, informative content."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=content_plan.get("target_length", 1500) * 2,
-                temperature=0.7
-            )
-            
-            content = response.choices[0].message.content
-            
-            # Store initial content in memory
-            await self.store_memory(
-                f"Initial content for {topic}: {content[:200]}...",
-                "initial_content",
-                0.6,
-                {"topic": topic, "writing_style": writing_style, "word_count": len(content.split())}
-            )
-            
-            logger.info(f"Generated initial content: {len(content)} characters")
-            return content
-            
-        except Exception as e:
-            logger.error(f"Initial content generation failed: {e}")
-            return await self._generate_fallback_content(topic, content_plan, research_data, writing_style)
+        """Generate initial content based on plan and research with LLM fallback and caching"""
+        logger.info(f"Generating initial content for topic: {topic}")
+        
+        # Create a hashable key for caching
+        cache_key = (topic, tuple(content_plan.items()), tuple(research_data.items()), writing_style)
+        
+        # Check cache first
+        if cache_key in self._generate_initial_content_cached.cache:
+            logger.info(f"Using cached initial content for topic: {topic}")
+            return self._generate_initial_content_cached.cache[cache_key]
+
+        content = ""
+        # Try OpenAI
+        if self.openai_client:
+            try:
+                prompt = self._create_content_generation_prompt(topic, content_plan, research_data, writing_style)
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are a professional content writer expert at creating engaging, informative content."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=content_plan.get("target_length", 1500) * 2,
+                    temperature=0.7
+                )
+                content = response.choices[0].message.content
+                logger.info(f"Generated initial content with OpenAI: {len(content)} characters")
+            except Exception as e:
+                logger.error(f"OpenAI initial content generation failed: {e}")
+        
+        # Try Gemini if OpenAI failed or not available
+        if not content and self.gemini_client:
+            try:
+                gemini_prompt = self._create_content_generation_prompt(topic, content_plan, research_data, writing_style)
+                gemini_response = self.gemini_client.generate_content(gemini_prompt)
+                content = gemini_response.text if hasattr(gemini_response, "text") else str(gemini_response)
+                logger.info(f"Generated initial content with Gemini: {len(content)} characters")
+            except Exception as e:
+                logger.error(f"Gemini initial content generation failed: {e}")
+
+        # Fallback to template-based if all LLMs fail
+        if not content:
+            logger.info("All LLMs failed, using fallback content generation")
+            content = await self._generate_fallback_content(topic, content_plan, research_data, writing_style)
+
+        # Store initial content in memory
+        await self.store_memory(
+            f"Initial content for {topic}: {content[:200]}...",
+            "initial_content",
+            0.6,
+            {"topic": topic, "writing_style": writing_style, "word_count": len(content.split())}
+        )
+        
+        # Cache the result
+        self._generate_initial_content_cached.cache[cache_key] = content
+        return content
+
+    # Apply LRU cache to the method for caching LLM calls
+    @lru_cache(maxsize=128) # Cache up to 128 recent results
+    def _generate_initial_content_cached(self, topic: str, content_plan: Dict[str, Any], 
+                                      research_data: Dict[str, Any], writing_style: str) -> str:
+        # This wrapper is needed for lru_cache on an async method.
+        # The actual logic is in _generate_initial_content
+        pass
     
     async def _generate_fallback_content(self, topic: str, content_plan: Dict[str, Any], 
                                        research_data: Dict[str, Any], writing_style: str) -> str:
@@ -391,4 +429,4 @@ class WriterAgent(BaseAgent):
             
         except Exception as e:
             logger.error(f"Failed to get writing history: {e}")
-            return [] 
+            return []

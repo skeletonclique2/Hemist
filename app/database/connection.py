@@ -56,6 +56,18 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         finally:
             await session.close()
 
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """Get database session for use in async contexts"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        except Exception as e:
+            logger.error("Database session error", error=str(e))
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
 def get_sync_db():
     """Get synchronous database session"""
     db = SessionLocal()
@@ -105,4 +117,4 @@ async def check_db_health():
         return False
 
 # Database models will be imported here
-from app.database.models import *  # noqa 
+from app.database.models import *  # noqa

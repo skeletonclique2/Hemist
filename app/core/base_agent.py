@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 import uuid
+import asyncio
 import structlog
 from enum import Enum
 
@@ -71,23 +72,54 @@ class BaseAgent(ABC):
         logger.info(f"Initialized {self.agent_type} agent: {name} ({agent_id})")
     
     @abstractmethod
-    async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute the agent's main functionality
-        Must be implemented by subclasses
-        """
-        # LangSmith tracing and Prometheus metrics
-        AGENT_EXECUTIONS.labels(agent_type=self.agent_type.value).inc()
-        with langsmith.trace(f"{self.agent_type.value}_execute", agent_id=self.agent_id, agent_name=self.name):
-            return await self._execute_impl(context)
-
-    @abstractmethod
     async def _execute_impl(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Subclasses must implement this method instead of execute.
+        This method will be wrapped with retry logic.
         """
         pass
     
+    async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute the agent's main functionality with retry logic and tracing.
+        """
+        AGENT_EXECUTIONS.labels(agent_type=self.agent_type.value).inc()
+        
+        retries = 0
+        max_retries = 3  # Define max retries
+        retry_delay_seconds = 2  # Initial delay in seconds
+        
+        while retries <= max_retries:
+            try:
+                # Try to use LangSmith tracing if available, otherwise skip
+                try:
+                    with langsmith.trace(f"{self.agent_type.value}_execute", agent_id=self.agent_id, agent_name=self.name, retry_attempt=retries):
+                        result = await self._execute_impl(context)
+                        return result
+                except Exception as trace_error:
+                    # If LangSmith fails, execute without tracing
+                    if "API key" in str(trace_error) or "LangSmith" in str(trace_error):
+                        logger.warning("LangSmith tracing unavailable, executing without tracing")
+                        result = await self._execute_impl(context)
+                        return result
+                    else:
+                        raise trace_error
+                        
+            except Exception as e:
+                logger.error(f"Agent {self.name} execution failed (attempt {retries+1}/{max_retries+1}): {e}")
+                await self.handle_error(e, f"execution attempt {retries+1}")
+                
+                if retries < max_retries:
+                    retries += 1
+                    await asyncio.sleep(retry_delay_seconds * (2 ** (retries - 1))) # Exponential backoff
+                    logger.info(f"Retrying agent {self.name} in {retry_delay_seconds * (2 ** (retries - 1))} seconds...")
+                else:
+                    logger.error(f"Agent {self.name} failed after {max_retries} retries.")
+                    raise # Re-raise the exception if all retries fail
+        
+        # This part should ideally not be reached
+        raise Exception("Unexpected state in agent execution retry loop.")
+
     async def initialize(self, config: Dict[str, Any] = None) -> bool:
         """Initialize the agent with configuration"""
         try:
@@ -188,45 +220,97 @@ class BaseAgent(ABC):
     
     async def store_memory(self, content: str, memory_type: str = "general", 
                           importance_score: float = 0.5, metadata: Dict[str, Any] = None) -> str:
-        """Store a new memory"""
+        """Store a new memory in the database"""
         try:
-            memory = AgentMemory(
-                content=content,
-                memory_type=memory_type,
-                importance_score=importance_score,
-                metadata=metadata or {}
-            )
+            from app.core.memory_manager import MemoryManager
+            from app.database.connection import get_db_session
             
-            self.memories.append(memory)
-            logger.debug(f"Agent {self.name} stored memory: {memory.id}")
-            return memory.id
-            
+            async with get_db_session() as session:
+                memory_manager = MemoryManager(session)
+                memory_id = await memory_manager.store_memory(
+                    content=content,
+                    memory_type=memory_type,
+                    importance_score=importance_score,
+                    metadata=metadata or {},
+                    agent_id=self.agent_id
+                )
+                logger.debug(f"Agent {self.name} stored memory: {memory_id}")
+                return memory_id
+                
         except Exception as e:
             logger.error(f"Failed to store memory for agent {self.name}: {e}")
             return ""
     
     async def retrieve_memories(self, query: str = None, memory_type: str = None, 
                               limit: int = 10) -> List[AgentMemory]:
-        """Retrieve memories based on criteria"""
+        """Retrieve memories from the database"""
         try:
-            memories = self.memories
+            from app.core.memory_manager import MemoryManager
+            from app.database.connection import get_db_session
             
-            # Filter by type if specified
-            if memory_type:
-                memories = [m for m in memories if m.memory_type == memory_type]
-            
-            # Filter by query if specified (simple text search for now)
-            if query:
-                query_lower = query.lower()
-                memories = [m for m in memories if query_lower in m.content.lower()]
-            
-            # Sort by importance and recency
-            memories.sort(key=lambda m: (m.importance_score, m.created_at), reverse=True)
-            
-            return memories[:limit]
-            
+            async with get_db_session() as session:
+                memory_manager = MemoryManager(session)
+                
+                # Get memories from database
+                db_memories = await memory_manager.retrieve_memories(
+                    query=query,
+                    memory_type=memory_type,
+                    limit=limit
+                )
+                
+                # Convert to AgentMemory objects
+                memories = []
+                for mem in db_memories:
+                    agent_memory = AgentMemory(
+                        id=mem['id'],
+                        content=mem['content'],
+                        memory_type=mem['memory_type'],
+                        importance_score=mem['importance_score'],
+                        created_at=mem['created_at'],
+                        metadata=mem.get('metadata', {})
+                    )
+                    memories.append(agent_memory)
+                
+                return memories
+                
         except Exception as e:
             logger.error(f"Failed to retrieve memories for agent {self.name}: {e}")
+            return []
+    
+    async def retrieve_similar_memories(self, query: str, limit: int = 5, 
+                                      similarity_threshold: float = 0.7) -> List[AgentMemory]:
+        """Retrieve similar memories using vector similarity search"""
+        try:
+            from app.core.memory_manager import MemoryManager
+            from app.database.connection import get_db_session
+            
+            async with get_db_session() as session:
+                memory_manager = MemoryManager(session)
+                
+                # Get similar memories from database
+                similar_memories = await memory_manager.retrieve_similar_memories(
+                    query=query,
+                    limit=limit,
+                    similarity_threshold=similarity_threshold
+                )
+                
+                # Convert to AgentMemory objects
+                memories = []
+                for mem in similar_memories:
+                    agent_memory = AgentMemory(
+                        id=mem['id'],
+                        content=mem['content'],
+                        memory_type=mem['memory_type'],
+                        importance_score=mem['importance_score'],
+                        created_at=mem['created_at'],
+                        metadata=mem.get('metadata', {})
+                    )
+                    memories.append(agent_memory)
+                
+                return memories
+                
+        except Exception as e:
+            logger.error(f"Failed to retrieve similar memories for agent {self.name}: {e}")
             return []
     
     async def reset(self) -> bool:
